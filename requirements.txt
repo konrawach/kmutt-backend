@@ -10,3 +10,4 @@ fastembed
 pypdf
 pymupdf
 python-dotenv
+docxtpl
