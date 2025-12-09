@@ -1,18 +1,24 @@
-from fastapi import FastAPI, HTTPException, Body
-from pydantic import BaseModel
+import os
+import re
+import json
+import uvicorn
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles # ไว้สำหรับทำ Link Download
+from pydantic import BaseModel
+
 from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
-from groq import Groq
+from groq import AsyncGroq
 from dotenv import load_dotenv
-import os
-import re
-import uvicorn
-
-from fastapi.responses import StreamingResponse
 from urllib.parse import quote
-from document_generator import generate_document_stream
+
+# Import ฟังก์ชันสร้างไฟล์ที่เราแยกไว้
+from document_generator import generate_document_stream, generate_document_auto
 
 load_dotenv()
 
@@ -22,8 +28,7 @@ QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 COLLECTION_NAME = "demo_collection_railway_v2"
 
-# ✅ 1. ฐานข้อมูลฟอร์มฉบับสมบูรณ์ (Master Data)
-# รวมรหัส, ชื่อไทย, และลิงก์ไว้ในที่เดียว เพื่อง่ายต่อการจัดการ
+# 📂 1. ฐานข้อมูลฟอร์ม (Master Data)
 FORM_MASTER_DATA = [
     {
         "id": "RO.01", 
@@ -141,76 +146,33 @@ FORM_MASTER_DATA = [
     },
 ]
 
-# ✅ 2. สร้างตัวแปรช่วยค้นหา (Lookup & Prompt Generation)
-FORM_DB = {}
-FORM_LIST_TEXT = "" # ตัวแปรนี้จะถูกส่งให้ AI อ่านเป็น "โพย"
-
+# เตรียม Text สำหรับ Prompt
+FORM_LIST_TEXT = ""
 for item in FORM_MASTER_DATA:
-    # สร้าง Dictionary สำหรับค้นหา URL เร็วๆ
-    FORM_DB[item["id"]] = item["url"]      # ค้นด้วยรหัส (เช่น "RO.01")
-    FORM_DB[item["name"]] = item["url"]    # ค้นด้วยชื่อ (เช่น "คำร้องทั่วไป")
-    
-    # เพิ่มรูปแบบย่อยๆ เผื่อ AI หรือ User พิมพ์ผิด
-    FORM_DB[item["id"].replace(".", "")] = item["url"]   # "RO01"
-    FORM_DB[item["id"].replace(".", ". ")] = item["url"] # "RO. 01"
-    
-    # สร้างข้อความสำหรับใส่ใน System Prompt
-    FORM_LIST_TEXT += f"- {item['name']} ใช้ฟอร์มรหัส: {item['id']}\n"
-# ================= GLOBAL VARIABLES (LAZY LOAD) =================
-# We declare them as None so they don't take up memory at startup
-vector_store_instance = None
-groq_client_instance = None
+    FORM_LIST_TEXT += f"- {item['name']} (รหัส: {item['id']})\n"
 
-def get_rag_system():
-    """
-    This function loads the models ONLY when they are needed.
-    It prevents the server from crashing during startup.
-    """
-    global vector_store_instance, groq_client_instance
-    
-    if vector_store_instance is None:
-        print("⏳ Lazy Loading: Initializing AI Models...")
-        
-        # 1. Setup Embeddings
-        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-        sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
-
-        # 2. Connect Qdrant
-        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-
-        # 3. Setup Vector Store
-        vector_store_instance = QdrantVectorStore(
-            client=client,
-            collection_name=COLLECTION_NAME,
-            embedding=embeddings,
-            sparse_embedding=sparse_embeddings,
-            retrieval_mode=RetrievalMode.HYBRID,
-            vector_name="dense_vector",
-            sparse_vector_name="sparse_vector",
-        )
-        
-        # 4. Setup Groq
-        groq_client_instance = Groq(api_key=GROQ_API_KEY)
-        
-        print("✅ Lazy Loading: Models are ready!")
-        
-    return vector_store_instance, groq_client_instance
-
-# ================= API SERVER =================
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# ================= PYDANTIC MODELS =================
 class UserRequest(BaseModel):
     message: str
 
-def get_ai_response(context, question, groq_client):
+class GenerateRequest(BaseModel):
+    form_type: str
+    student_id: str
+    form_data: Dict[str, Any]
+
+class SourceItem(BaseModel):
+    doc: str
+    page: int
+    url: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    sources: List[SourceItem]
+
+# ================= AI FUNCTIONS (2 บุคลิก) =================
+
+# 1. บุคลิก "ที่ปรึกษา" (Advisor) - ตอบคำถามทั่วไป
+async def get_advisor_response(context: str, question: str, client: AsyncGroq) -> str:
     system_prompt =f'''
         คุณคือ "น้องผู้ช่วย มจธ." (KMUTT Assistant) ผู้เชี่ยวชาญด้านงานทะเบียนและเอกสารคำร้อง
         หน้าที่ของคุณคือ: ให้คำแนะนำที่ถูกต้อง กระชับ และเป็นมิตรกับนักศึกษา (เหมือนรุ่นพี่แนะนำรุ่นน้อง)
@@ -240,101 +202,175 @@ def get_ai_response(context, question, groq_client):
         2. ใช้แบบฟอร์ม **สทน. 12 (RO.12)** ประกอบการยื่น
         ⬇️ ดาวน์โหลดที่นี่: https://regis.kmutt.ac.th/service/form/RO-12Updated.pdf"
     '''
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question}"}
-    ]
-    
     try:
-        response = groq_client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.1
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.3
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"AI Error: {str(e)}"
+        return f"AI Error: {e}"
+
+# 2. บุคลิก "นักแกะข้อมูล" (Extractor) - สร้าง JSON เท่านั้น
+async def get_extractor_response(question: str, client: AsyncGroq) -> str:
+    # โพย Schema (ใส่ให้ครบทุกฟอร์มที่รองรับ)
+    schemas = """
+    [RO-01] {"form_type": "RO-01","request_subject": "","recipient": "","student_name": "","student_id": "","faculty": "","department": "","class_level": "","semester_gpa": "","cumulative_gpa": "","advisor_name": "","student_tel": "","student_email": "","request_details":"แต่งภาษาทางการ"}
+    [RO-03] {"form_type": "RO-03","request_subject": "","recipient": "","student_name": "","student_id": "","faculty": "","department": "","class_level": "","address_no": "","address_moo": "","address_soi": "","address_road": "","address_subdistrict": "","address_district": "","address_province": "","address_postal_code": "","phone_home": "","phone_mobile": "","Parental_certification":"แต่งภาษาทางการ","date_day": "","date_month": "","date_year": ""}
+    [RO-13] {"form_type": "RO-13","recipient": "","enclosure_2": "","student_name": "","faculty": "","department": "","class_level": "","advisor_name": "","student_tel": "","student_email": "","reason_study_at_location": "","reason_other_details": "แต่งภาษาทางการ","date_day": "","date_month": "","date_year": ""}
+    [RO-16] {"form_type": "RO-16","recipient": "","enclosure_1": "","enclosure_2": "","student_name": "","student_id": "","faculty": "","department": "","class_level": "","advisor_name": "","student_tel": "","student_email": "","leave_days": "","date_from": "","date_to": "","leave_reason":"แต่งภาษาทางการ","date_day": "","date_month": "","date_year": ""}
+    """
+    system_prompt = f"""
+    คุณคือ Data Extractor
+    หน้าที่: แปลงคำพูดผู้ใช้เป็น JSON เพื่อกรอกฟอร์ม
+    กฎ: 
+    1. ห้ามตอบเป็นประโยคสนทนา ให้ตอบ JSON Block เดียวเท่านั้น
+    2. ถ้าข้อมูลไม่ครบ ให้ใส่ค่าว่าง ""
+    3. แต่งประโยคในช่อง reason/details ให้เป็นภาษาทางการ
+    4. ในช่อง date_month ให้ใช้ตัวเลขเช่น 03 แทนเดือนมีนาคม
+    
+    Schemas:
+    {schemas}
+    """
+    try:
+        response = await client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.1, # ค่าต่ำเพื่อให้โครงสร้างแม่นยำ
+            response_format={"type": "json_object"}
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return "{}"
+
+# ================= APP SETUP =================
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# เปิดให้เข้าถึงโฟลเดอร์ output ได้ผ่าน Browser (สำหรับโหลดไฟล์)
+os.makedirs("output", exist_ok=True)
+app.mount("/download", StaticFiles(directory="output"), name="download")
+
+# โหลด Model แบบ Global (เพื่อให้เร็ว ไม่ต้องโหลดใหม่ทุกรอบ)
+print("⏳ Initializing Models...")
+embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+vector_store = QdrantVectorStore(
+    client=qdrant_client,
+    collection_name=COLLECTION_NAME,
+    embedding=embeddings,
+    sparse_embedding=sparse_embeddings,
+    retrieval_mode=RetrievalMode.HYBRID,
+    vector_name="dense_vector",
+    sparse_vector_name="sparse_vector",
+)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+print("✅ Models Ready!")
+
+# ================= ENDPOINTS =================
 
 @app.get("/")
 def read_root():
     return {"status": "Server is running 🚀"}
 
-@app.post("/chat")
-def chat_endpoint(req: UserRequest):
-    print(f"📩 คำถาม: {req.message}")
-    vector_store, groq_client = get_rag_system()
-    user_query = req.message.lower()
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(req: UserRequest):
+    print(f"📩 ข้อความเข้า: {req.message}")
     
-    try:
+    # ---------------------------------------------------------
+    # 🚦 STEP 1: ROUTER - เช็คเจตนาผู้ใช้
+    # ---------------------------------------------------------
+    trigger_words = ["สร้างไฟล์", "เจนไฟล์", "กรอกให้หน่อย", "ร่างคำร้อง", "ทำเอกสาร", "ออกใบ"]
+    user_wants_file = any(word in req.message.lower() for word in trigger_words)
+
+    if user_wants_file:
+        # === 🅰️ โหมดสร้างไฟล์ ===
+        print("⚙️ Detect: สร้างไฟล์")
+        
+        # 1. ให้ AI แกะ JSON
+        json_data_str = await get_extractor_response(req.message, groq_client)
+        
+        # 2. สร้างไฟล์ .docx (บันทึกลง Disk)
+        # ใช้ฟังก์ชัน generate_document_auto จาก document_generator.py
+        file_path = generate_document_auto(json_data_str)
+        
+        if file_path:
+            filename = os.path.basename(file_path)
+            # สร้างลิงก์สำหรับดาวน์โหลด (สมมติรันบน localhost)
+            # ถ้าขึ้น Server จริง ต้องเปลี่ยน localhost เป็น Domain ของคุณ
+            base_url = os.getenv("APP_URL", "http://localhost:8000") 
+            download_url = f"{base_url}/download/{filename}"
+            
+            return ChatResponse(
+                reply=f"✅ ผมร่างเอกสารให้เรียบร้อยแล้วครับ!\n\n📂 **ดาวน์โหลดไฟล์ Word ได้ที่นี่:**\n{download_url}\n\n(คุณสามารถนำไปแก้ไขจัดหน้าต่อได้เลยครับ)",
+                sources=[]
+            )
+        else:
+            return ChatResponse(reply="ขออภัยครับ ผมไม่แน่ใจว่าต้องใช้ฟอร์มไหน หรือข้อมูลไม่เพียงพอ", sources=[])
+
+    else:
+        # === 🅱️ โหมดตอบคำถาม (RAG) ===
+        print("💬 Detect: ตอบคำถาม")
+        
+        # 1. ค้นหาใน Vector DB
+        search_results = vector_store.similarity_search(req.message, k=3)
+        
+        # 2. รวม Context + หาลิงก์ PDF ต้นฉบับ
         context_text = ""
         sources = []
         
-        # ---------------------------------------------------------
-        # ✅ ขั้นตอนที่ 1: "ค้นหาจาก Keywords" (แม่นยำ 100%)
-        # ---------------------------------------------------------
-        found_in_master = False
-        
+        # (Logic เดิมของคุณที่ใช้ FORM_MASTER_DATA เช็คคีย์เวิร์ด)
         for item in FORM_MASTER_DATA:
-            # วนลูปเช็ค keyword ในลิสต์ของแต่ละฟอร์ม
             for kw in item["keywords"]:
-                if kw in user_query: # ถ้าเจอคำนี้ในคำถาม (เช่น "ดรอป")
-                    found_in_master = True
-                    print(f"🎯 เจอ Keyword '{kw}' -> ตรงกับฟอร์ม: {item['id']}")
-                    
-                    # บังคับยัดข้อมูลที่ถูกต้องใส่ Context ให้ AI เลย
-                    context_text += f"\n[ข้อมูลสำคัญจากระบบ]: ผู้ใช้กำลังถามถึง '{item['name']}' ซึ่งตรงกับคีย์เวิร์ด '{kw}' รหัสเอกสารคือ '{item['id']}'. ลิงก์ดาวน์โหลดคือ {item['url']}\n"
-                    
-                    # เพิ่มปุ่มดาวน์โหลดทันที
-                    if not any(s['url'] == item["url"] for s in sources):
-                        sources.append({
-                            "doc": f"{item['id']} {item['name']}",
-                            "page": 1,
-                            "url": item["url"]
-                        })
-                    break # เจอแล้วหยุดเช็คฟอร์มนี้ ไปฟอร์มอื่นต่อ (เผื่อถามหลายเรื่อง)
+                if kw in req.message.lower():
+                    context_text += f"\n[ระบบแนะนำ]: ผู้ใช้ถามถึง '{item['name']}' ({item['id']})\n"
+                    # เพิ่ม Source อัตโนมัติ
+                    if not any(s.url == item["url"] for s in sources):
+                        sources.append(SourceItem(doc=item["name"], page=1, url=item["url"]))
+                    break
 
-        # ---------------------------------------------------------
-        # ✅ ขั้นตอนที่ 2: ค้นหา Vector DB (Qdrant) เพิ่มเติม
-        # ---------------------------------------------------------
-        # ถ้าเจอ Keyword แล้ว ค้นน้อยลง (k=1)
-        k_val = 1 if found_in_master else 3
-        search_results = vector_store.similarity_search(req.message, k=k_val)
-        
         for doc in search_results:
             context_text += f"{doc.page_content}\n\n"
-            
-            # (ส่วนหาลิงก์จาก PDF เหมือนเดิม เผื่อกรณี Keyword ไม่ครอบคลุม)
-            file_path = doc.metadata.get("file", "เอกสารทั่วไป")
-            doc_url = ""
-            display_name = file_path.split("/")[-1]
+            # ... (Logic ดึง Source จาก Metadata ของคุณ) ...
 
-            # พยายาม Match ลิงก์จาก FORM_MASTER_DATA
-            for item in FORM_MASTER_DATA:
-                if item["url"] in file_path or item["id"] in doc.page_content:
-                    doc_url = item["url"]
-                    display_name = f"{item['id']} {item['name']}"
-                    break
-            
-            if not doc_url:
-                found_urls = re.findall(r'(https?://[^\s\)]+)', doc.page_content)
-                if found_urls: doc_url = found_urls[0]
+        # 3. ให้ AI ตอบ
+        answer = await get_advisor_response(context_text, req.message, groq_client)
+        
+        return ChatResponse(reply=answer, sources=sources)
 
-            if doc_url:
-                if not any(s['url'] == doc_url for s in sources):
-                    sources.append({
-                        "doc": display_name,
-                        "page": 1,
-                        "url": doc_url
-                    })
-
-        answer = get_ai_response(context_text, req.message, groq_client)
-        return { "reply": answer, "sources": sources }
+# --- Endpoint สำหรับ Generate ไฟล์แบบ Stream (ถ้าจะใช้แยก) ---
+@app.post("/generate-document")
+async def generate_document(req: GenerateRequest):
+    print(f"🖨️ Generate Request: {req.form_type}")
+    file_stream = generate_document_stream(json.dumps(req.form_data))
     
-    except Exception as e:
-        print(f"Error: {e}")
-        return { "reply": "เกิดข้อผิดพลาดในระบบ", "sources": [] }
+    if not file_stream:
+        raise HTTPException(status_code=500, detail="สร้างไฟล์ไม่สำเร็จ")
+
+    filename = f"Filled_{req.form_type}_{req.student_id}.docx"
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        file_stream, 
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"}
+    )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000)) 
     uvicorn.run(app, host="0.0.0.0", port=port)
